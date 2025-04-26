@@ -1,5 +1,5 @@
 # MarkDB
-Banco de dados com MarkDown ótimo para treinar IA
+## Banco de dados com MarkDown ótimo para treinar IAs simples. Rápido e de fácil entendimento. 
 
 ![image](https://github.com/user-attachments/assets/2f55d9b8-9c90-488a-8ae9-28053fbb6435)
 
