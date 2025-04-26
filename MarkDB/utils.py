@@ -9,6 +9,12 @@ import streamlit as st
 from datetime import datetime
 from openai import OpenAI
 from db import DB_PATH
+import aiosqlite
+import asyncio
+import pytesseract
+from PIL import Image
+import aiofiles
+
 
 # === FUNÇÕES AUXILIARES ===
 def get_openai_client():
@@ -83,198 +89,184 @@ def format_table(matrix):
     return markdown
 
 # === PROCESSADOR DE IMAGENS ===
-def process_image_to_chunks(file_path):
-    """Processa arquivos de imagem (JPG, PNG)"""
+async def process_image_to_chunks(file_path):
+    """Processa imagens de forma assíncrona e extrai texto OCR."""
+    img = Image.open(file_path)
+    text = pytesseract.image_to_string(img)
     file_name = Path(file_path).name
-    
-    # Verifica se temos um cliente OpenAI configurado
-    client = get_openai_client()
-    if client is None:
-        st.error("""🔒 API da OpenAI não configurada. 
-                Por favor, vá para 'Configurações' e insira sua chave API para gerar descrições de imagens.""")
-        return False
-    
-    try:
-        with open(file_path, "rb") as f:
-            image_bytes = f.read()
-        
-        # Gera descrição da imagem
-        with st.spinner("Gerando descrição da imagem..."):
-            image_description = generate_image_description(image_bytes)
-        
-        if image_description is None:
-            st.warning("Não foi possível gerar uma descrição para a imagem")
-            image_description = "Descrição não disponível"
-        
-        # Codifica a imagem em base64
-        b64_image = base64.b64encode(image_bytes).decode('ascii')
-        
-        # Prepara o conteúdo para o banco de dados
-        image_meta = f"**Arquivo**: {file_name}\n**Tipo**: Imagem\n**Descrição**: {image_description}"
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (file_name, 1, 1, image_meta, "imagem", datetime.now().strftime("%d/%m/%Y"), image_description, b64_image))
-        
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Erro ao processar imagem: {str(e)}")
-        return False
+    upload_time = datetime.now().strftime("%d/%m/%Y")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if text.strip():
+            chunks = textwrap.wrap(text, st.session_state.CHUNK_SIZE)
+            chunk_counter = 1
+            for chunk in chunks:
+                chunk_type = detect_chunk_type(chunk)
+                markdown_chunk = f"**Arquivo**: {file_name}\n**Chunk**: {chunk_counter}\n\n{chunk.strip()}"
+                await db.execute('''
+                    INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (file_name, None, chunk_counter, markdown_chunk, chunk_type, upload_time, None, None))
+                chunk_counter += 1
+        await db.commit()
 
 # === PROCESSADOR DE PDF ===
-def process_pdf_to_chunks(file_path):
-    """Processa arquivos PDF e extrai texto, tabelas e imagens"""
+async def process_pdf_to_chunks(file_path):
+    """Processa arquivos PDF de forma assíncrona, extrai texto, tabelas e imagens."""
     doc = fitz.open(file_path)
     file_name = Path(file_path).name
     upload_time = datetime.now().strftime("%d/%m/%Y")
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    async with aiosqlite.connect(DB_PATH) as db:
+        tasks = []
+        for page_index in range(len(doc)):
+            page = doc.load_page(page_index)
+            tasks.append(process_page(db, doc, page, file_name, upload_time, page_index))
 
-    for page_index in range(len(doc)):
-        page = doc.load_page(page_index)
-        text = page.get_text("text")
-        tables = page.find_tables()
-        images = page.get_images(full=True)
-        chunk_counter = 1
+        await asyncio.gather(*tasks)
+        await db.commit()
 
-        # Processa texto
-        if text.strip():
-            chunks = textwrap.wrap(text, st.session_state.CHUNK_SIZE)
-            for chunk in chunks:
-                chunk_type = detect_chunk_type(chunk)
-                markdown_chunk = f"**Arquivo**: {file_name}\n**Página**: {page_index + 1}\n**Chunk**: {chunk_counter}\n\n{chunk.strip()}"
-                c.execute('''
+async def process_page(db, doc, page, file_name, upload_time, page_index):
+    """Processa uma única página do PDF."""
+    text = page.get_text("text")
+    tables = page.find_tables()
+    images = page.get_images(full=True)
+    chunk_counter = 1
+
+    # Processa texto
+    if text.strip():
+        chunks = textwrap.wrap(text, st.session_state.CHUNK_SIZE)
+        for chunk in chunks:
+            chunk_type = detect_chunk_type(chunk)
+            markdown_chunk = f"**Arquivo**: {file_name}\n**Página**: {page_index + 1}\n**Chunk**: {chunk_counter}\n\n{chunk.strip()}"
+            await db.execute('''
+                INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (file_name, page_index + 1, chunk_counter, markdown_chunk, chunk_type, upload_time, None, None))
+            chunk_counter += 1
+
+    # Processa tabelas
+    if tables:
+        for table in tables:
+            matrix = table.extract()
+            markdown_table = format_table(matrix)
+            if markdown_table:
+                markdown_chunk = f"**Arquivo**: {file_name}\n**Página**: {page_index + 1}\n**Chunk**: {chunk_counter}\n\n{markdown_table}"
+                await db.execute('''
                     INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (file_name, page_index + 1, chunk_counter, markdown_chunk, chunk_type, upload_time, None, None))
+                ''', (file_name, page_index + 1, chunk_counter, markdown_chunk, "tabela", upload_time, None, None))
                 chunk_counter += 1
 
-        # Processa tabelas
-        if tables:
-            for table in tables:
-                matrix = table.extract()
-                markdown_table = format_table(matrix)
-                if markdown_table:
-                    markdown_chunk = f"**Arquivo**: {file_name}\n**Página**: {page_index + 1}\n**Chunk**: {chunk_counter}\n\n{markdown_table}"
-                    c.execute('''
-                        INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (file_name, page_index + 1, chunk_counter, markdown_chunk, "tabela", upload_time, None, None))
-                    chunk_counter += 1
+    # Processa imagens
+    image_tasks = []
+    for img in images:
+        image_tasks.append(process_image(db, doc, img, file_name, upload_time, page_index, chunk_counter))
+        chunk_counter += 1
 
-        # Processa imagens
-        for img in images:
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            
-            try:
-                # Verifica se temos cliente OpenAI para gerar descrição
-                client = get_openai_client()
-                if client is None:
-                    image_description = "Descrição não disponível (API não configurada)"
-                else:
-                    # Gera descrição da imagem
-                    image_description = generate_image_description(image_bytes)
-                    if image_description is None:
-                        image_description = "Descrição não disponível"
-                
-                # Codifica a imagem em base64
-                b64_image = base64.b64encode(image_bytes).decode('ascii')
-                
-                # Armazena metadados e dados da imagem
-                image_meta = f"**Arquivo**: {file_name}\n**Página**: {page_index + 1}\n**Chunk**: {chunk_counter}\n**Descrição**: {image_description}"
-                
-                c.execute('''
-                    INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (file_name, page_index + 1, chunk_counter, image_meta, "imagem", upload_time, image_description, b64_image))
-                chunk_counter += 1
-                
-            except Exception as e:
-                st.error(f"Erro ao processar imagem: {str(e)}")
-                continue
+    if image_tasks:
+        await asyncio.gather(*image_tasks)
 
-    conn.commit()
-    conn.close()
+async def process_image(db, doc, img, file_name, upload_time, page_index, chunk_counter):
+    """Processa uma única imagem extraída do PDF."""
+    try:
+        xref = img[0]
+        base_image = doc.extract_image(xref)
+        image_bytes = base_image["image"]
+
+        client = get_openai_client()
+        if client is None:
+            image_description = "Descrição não disponível (API não configurada)"
+        else:
+            image_description = generate_image_description(image_bytes)
+            if image_description is None:
+                image_description = "Descrição não disponível"
+
+        b64_image = base64.b64encode(image_bytes).decode('ascii')
+        image_meta = f"**Arquivo**: {file_name}\n**Página**: {page_index + 1}\n**Chunk**: {chunk_counter}\n**Descrição**: {image_description}"
+
+        await db.execute('''
+            INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (file_name, page_index + 1, chunk_counter, image_meta, "imagem", upload_time, image_description, b64_image))
+
+    except Exception as e:
+        st.error(f"Erro ao processar imagem: {str(e)}")
+
 
 # === PROCESSADOR DE DOCX ===
-def process_docx_to_chunks(file_path):
-    """Processa arquivos DOCX (Word)"""
-    file_name = Path(file_path).name
-    upload_time = datetime.now().strftime("%d/%m/%Y")
-    
-    try:
-        doc = docx.Document(file_path)
-        full_text = []
-        
-        for para in doc.paragraphs:
-            full_text.append(para.text)
-        
-        text = '\n'.join(full_text)
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        if text.strip():
-            chunks = textwrap.wrap(text, st.session_state.CHUNK_SIZE)  # Usando session_state
-            for i, chunk in enumerate(chunks, 1):
-                chunk_type = detect_chunk_type(chunk)
-                markdown_chunk = f"**Arquivo**: {file_name}\n**Chunk**: {i}\n\n{chunk.strip()}"
-                c.execute('''
-                    INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (file_name, 1, i, markdown_chunk, chunk_type, upload_time, None, None))
-        
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Erro ao processar documento Word: {str(e)}")
-        return False
 
-# === PROCESSADOR DE XLSX ===
-def process_xlsx_to_chunks(file_path):
-    """Processa arquivos XLSX (Excel)"""
+async def process_docx_to_chunks(file_path):
+    """Processa arquivos DOCX de forma assíncrona e extrai textos e tabelas."""
+    doc = docx.Document(file_path)
     file_name = Path(file_path).name
     upload_time = datetime.now().strftime("%d/%m/%Y")
-    
-    try:
-        wb = openpyxl.load_workbook(file_path)
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        sheet_counter = 0
-        
-        for sheet_name in wb.sheetnames:
-            sheet_counter += 1
-            ws = wb[sheet_name]
-            data = []
-            
-            for row in ws.iter_rows(values_only=True):
-                data.append(row)
-            
-            if data:
-                markdown_table = format_table(data)
-                if markdown_table:
-                    markdown_chunk = f"**Arquivo**: {file_name}\n**Planilha**: {sheet_name}\n**Chunk**: {sheet_counter}\n\n{markdown_table}"
-                    c.execute('''
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        chunk_counter = 1
+        tasks = []
+
+        # Processa parágrafos de texto
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                chunks = textwrap.wrap(text, st.session_state.CHUNK_SIZE)
+                for chunk in chunks:
+                    chunk_type = detect_chunk_type(chunk)
+                    markdown_chunk = f"**Arquivo**: {file_name}\n**Chunk**: {chunk_counter}\n\n{chunk.strip()}"
+                    tasks.append(db.execute('''
                         INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (file_name, sheet_counter, 1, markdown_chunk, "tabela", upload_time, None, None))
-        
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Erro ao processar planilha Excel: {str(e)}")
-        return False
+                    ''', (file_name, None, chunk_counter, markdown_chunk, chunk_type, upload_time, None, None)))
+                    chunk_counter += 1
 
+        # Processa tabelas do documento
+        for table in doc.tables:
+            matrix = []
+            for row in table.rows:
+                matrix.append([cell.text.strip() for cell in row.cells])
+            markdown_table = format_table(matrix)
+            if markdown_table:
+                markdown_chunk = f"**Arquivo**: {file_name}\n**Chunk**: {chunk_counter}\n\n{markdown_table}"
+                tasks.append(db.execute('''
+                    INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (file_name, None, chunk_counter, markdown_chunk, "tabela", upload_time, None, None)))
+                chunk_counter += 1
+
+        if tasks:
+            await asyncio.gather(*tasks)
+            await db.commit()
+
+# === PROCESSADOR DE XLSX ===
+async def process_xlsx_to_chunks(file_path):
+    """Processa arquivos XLSX de forma assíncrona e extrai dados."""
+    wb = openpyxl.load_workbook(file_path)
+    file_name = Path(file_path).name
+    upload_time = datetime.now().strftime("%d/%m/%Y")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        chunk_counter = 1
+        tasks = []
+
+        # Processa as planilhas e as linhas
+        for sheet in wb.sheetnames:
+            ws = wb[sheet]
+            for row in ws.iter_rows(values_only=True):
+                row_data = ' | '.join([str(cell) if cell is not None else '' for cell in row])
+                if row_data.strip():
+                    markdown_chunk = f"**Arquivo**: {file_name}\n**Planilha**: {sheet}\n**Chunk**: {chunk_counter}\n\n{row_data}"
+                    tasks.append(db.execute('''
+                        INSERT INTO chunks (file_name, page_number, chunk_number, content, chunk_content, upload_time, image_description, image_data)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (file_name, None, chunk_counter, markdown_chunk, "tabela", upload_time, None, None)))
+                    chunk_counter += 1
+
+        if tasks:
+            await asyncio.gather(*tasks)
+            await db.commit()
+
+            
 # === EXPORTAÇÃO PARA MD ===
 def export_chunk_to_md(chunk_id):
     """Exporta um chunk específico para um arquivo Markdown"""
