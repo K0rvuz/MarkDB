@@ -3,6 +3,7 @@ import os
 import base64
 import streamlit as st
 import pandas as pd
+import asyncio 
 from io import BytesIO
 from db import init_db, DB_PATH
 from utils import get_openai_client, generate_image_description, detect_chunk_type, format_table, process_docx_to_chunks,process_image_to_chunks,process_pdf_to_chunks,process_xlsx_to_chunks, export_all_chunks_to_md,export_chunk_to_md
@@ -37,22 +38,22 @@ def main():
                 f.write(uploaded_file.getbuffer())
             
             if file_ext in ["jpg", "jpeg", "png"]:
-                success = process_image_to_chunks(file_path)
+                success = asyncio.run(process_image_to_chunks(file_path))
                 if success:
                     st.success("✅ Imagem processada com sucesso!")
                 else:
                     st.error("❌ Falha ao processar a imagem")
             elif file_ext == "pdf":
                 with st.spinner("Processando PDF..."):
-                    process_pdf_to_chunks(file_path)
+                    asyncio.run(process_pdf_to_chunks(file_path))
                     st.success("✅ PDF processado com sucesso!")
             elif file_ext == "docx":
                 with st.spinner("Processando documento Word..."):
-                    process_docx_to_chunks(file_path)
+                    asyncio.run(process_docx_to_chunks(file_path))
                     st.success("✅ Documento Word processado com sucesso!")
             elif file_ext == "xlsx":
                 with st.spinner("Processando planilha Excel..."):
-                    process_xlsx_to_chunks(file_path)
+                    asyncio.run(process_xlsx_to_chunks(file_path))
                     st.success("✅ Planilha Excel processada com sucesso!")
             
             if os.path.exists(file_path):
