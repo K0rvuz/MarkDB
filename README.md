@@ -18,7 +18,7 @@
 
 
 
-# Visualise e baixe o conteúdo em .md:
+# Visualize e baixe o conteúdo em .md:
 
 
 
